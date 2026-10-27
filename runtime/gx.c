@@ -3382,6 +3382,10 @@ void sdk_GXCopyDisp(void) {
                    (unsigned long)(recomp_wr_sweep_pages / 300), recomp_wr_sweep_ticks * 1e6 / SYSCLOCK_ARM11 / 300);
         st_gq_recs = st_gq_words = st_desc_calls = st_desc_recs = 0;
         recomp_wr_sweep_pages = 0; recomp_wr_sweep_ticks = 0;
+        extern u32 recomp_libm_pairs, recomp_libm_pair_waste;   /* libm.c */
+        recomp_log("# libm frame %lu: per frame %.1f cos calls served by a sin/cos pair, %.1f pairs unused\n", (unsigned long)game_frames,
+                   recomp_libm_pairs / 300.0, recomp_libm_pair_waste / 300.0);
+        recomp_libm_pairs = recomp_libm_pair_waste = 0;
     }
     recomp_wr_sweep();   /* the frame's marked pages get the epoch that is ending */
     __dmb();   /* the frame's guest writes before the epoch that ends it (epoch_now) */

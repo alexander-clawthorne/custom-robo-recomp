@@ -194,27 +194,67 @@ static void put(const St *s, double f1) {
     if (s->ca0) cpu.xer_ca = 0;
 }
 
+/* the result and registers of sin (c 0) or cos (c 1) of x for 0x3fe921fb < ix <= 0x413921fb, from
+ * rem_pio2's n, y0, y1 and the registers it left in *s */
+static inline __attribute__((always_inline)) double from_rem(St *s, s32 n, double y0, double y1) {
+    switch (n & 3) {
+    case 0: s->r3 = 1; return k_sin(s, y0, y1, 1);
+    case 1: return k_cos(s, y0, y1);
+    case 2: s->r3 = 1; return fneg_d(k_sin(s, y0, y1, 1));
+    default: return fneg_d(k_cos(s, y0, y1));
+    }
+}
+
+/* sin/cos pairs: the game mostly calls sin(a) then cos(a) (0x8019fc14: three angles), ~900 of each per 2v2
+ * frame. When the last sin was followed by cos of the same argument, a sin call also computes cos (sharing
+ * rem_pio2, the two kernels independent) and keeps its result and registers; the cos call then only writes
+ * them. sin and cos are pure functions of f1, so the cos call leaves exactly what its own evaluation would. */
+static u64 memo_x;
+static St memo_s;
+static double memo_r;
+static int memo_ok, pair_hint = 1, sin_pending;
+static u64 sin_x;
+u32 recomp_libm_pairs, recomp_libm_pair_waste;   /* cos calls served from a pair; pairs not used */
+
 /* 0x80168f38 sin / 0x801689d0 cos; 0: done, 1: translated body needed */
 static int nat_sincos(int c) {
     double x = F[1].ps0, res;
+    u64 xb = d2u(x);
+    if (c && memo_ok && xb == memo_x) { memo_ok = 0; recomp_libm_pairs++; put(&memo_s, memo_r); return 0; }
+    if (memo_ok) { memo_ok = 0; pair_hint = 0; recomp_libm_pair_waste++; }
+    if (c && sin_pending && xb == sin_x) pair_hint = 1;   /* a pair the last sin did not compute */
+    sin_pending = 0;
     u32 ix = hi(x) & 0x7fffffffu;
     St s = {0};
+    if ((s32)ix > 0x413921fb) return 1;
+    if (!c && pair_hint) {
+        St sc;
+        double rc;
+        if ((s32)ix <= 0x3fe921fb) {
+            s.f2 = 0.0; sc = s;
+            s.r3 = 0; res = k_sin(&s, x, 0.0, 0);
+            sc.r3 = ix; rc = k_cos(&sc, x, 0.0);
+        } else {
+            double y0, y1;
+            s32 n = rem_pio2(&s, x, &y0, &y1);
+            s.f2 = y1; sc = s;
+            res = from_rem(&s, n, y0, y1);
+            rc = from_rem(&sc, n + 1, y0, y1);   /* cos(x) = sin(x + pi/2) */
+        }
+        memo_x = xb; memo_s = sc; memo_r = rc; memo_ok = 1;
+        put(&s, res);
+        return 0;
+    }
+    if (!c) { sin_pending = 1; sin_x = xb; }
     if ((s32)ix <= 0x3fe921fb) {
         s.f2 = 0.0;
         if (c) { s.r3 = ix; res = k_cos(&s, x, 0.0); }
         else { s.r3 = 0; res = k_sin(&s, x, 0.0, 0); }
-    } else if ((s32)ix > 0x413921fb) {
-        return 1;
     } else {
         double y0, y1;
-        s32 n = rem_pio2(&s, x, &y0, &y1) + c;   /* cos(x) = sin(x + pi/2) */
+        s32 n = rem_pio2(&s, x, &y0, &y1) + c;
         s.f2 = y1;
-        switch (n & 3) {
-        case 0: s.r3 = 1; res = k_sin(&s, y0, y1, 1); break;
-        case 1: res = k_cos(&s, y0, y1); break;
-        case 2: s.r3 = 1; res = fneg_d(k_sin(&s, y0, y1, 1)); break;
-        default: res = fneg_d(k_cos(&s, y0, y1)); break;
-        }
+        res = from_rem(&s, n, y0, y1);
     }
     put(&s, res);
     return 0;
@@ -296,6 +336,25 @@ void recomp_libm_bench(void) {
             }
         }
         recomp_log("# bench libm %s native-vs-translated: %d inputs (%lu via the translated body), %lu differ\n", name[f], N, fb, bad);
+    }
+    for (int f = 0; f < 2; f++) {   /* pairs: native sin(f) then cos(f) of the same input vs the translated cos(f) */
+        u32 bad = 0, hits = 0; const int N = 20000;
+        for (int i = 0; i < N; i++) {
+            CPU c = save;
+            c.gpr[1] = B_STACK; c.gpr[3] = rnd32(); c.gpr[4] = rnd32(); c.gpr[6] = rnd32(); c.xer_ca = rnd32() & 1;
+            for (int k = 1; k <= 4; k++) { c.fpr[k].ps0 = rnd_u() - 0.5; c.fpr[k].ps1 = rnd_u() + 7.0; }
+            c.fpr[1].ps0 = input(i); c.lr = 0x80001234u;
+            CPU a, b;
+            cpu = c; tr[1 + 2 * f](); a = cpu;
+            cpu = c; pair_hint = 1; nat[2 * f]();
+            u32 p0 = recomp_libm_pairs;
+            cpu = c; nat[1 + 2 * f](); b = cpu;
+            hits += recomp_libm_pairs != p0;
+            if (!same(&a, &b) && bad++ < 4)
+                recomp_log("# bench libm pair %s mismatch x %016llx: f1 %016llx/%016llx\n", name[1 + 2 * f], d2u(c.fpr[1].ps0),
+                           d2u(a.fpr[1].ps0), d2u(b.fpr[1].ps0));
+        }
+        recomp_log("# bench libm pair %s then %s: %d inputs, %lu served by the pair, %lu differ\n", name[2 * f], name[1 + 2 * f], N, hits, bad);
     }
     for (int f = 0; f < 2; f++) {   /* timings on medium arguments */
         u64 ts[2];
