@@ -66,10 +66,20 @@ AXFAST ?= 1
 ifeq ($(AXFAST),0)
 CFLAGS	+=	-DRECOMP_AX_REF
 endif
+# AXSPEC=0: no decode predictions on the AX mix worker (runtime/ax.c spec_extend); needs `make clean` too
+AXSPEC ?= 1
+ifeq ($(AXSPEC),0)
+CFLAGS	+=	-DRECOMP_AX_NO_SPEC
+endif
 # ALIGNVERIFY=1: every misaligned 16/32-bit guest access is logged per host site (runtime/ppc.h ALN, "# align" lines)
 ALIGNVERIFY ?= 0
 ifeq ($(ALIGNVERIFY),1)
 CFLAGS	+=	-DRECOMP_ALIGN_VERIFY
+endif
+# RANGEVERIFY=1: every 8/16/32-bit guest access outside 0x80000000-0x81ffffff is logged the same way
+RANGEVERIFY ?= 0
+ifeq ($(RANGEVERIFY),1)
+CFLAGS	+=	-DRECOMP_RANGE_VERIFY
 endif
 # AXWORKER=0: the AX mix jobs (resampling, volumes, output) run on the game thread at once instead of on a
 # worker thread on core 2 (runtime/ax.c job_start); needs `make clean` too
@@ -108,7 +118,7 @@ export _3DSXFLAGS += --smdh=$(CURDIR)/$(TARGET).smdh
 
 .PHONY: all clean
 all: $(BUILD)
-	@sh tools/buildinfo.sh $(BUILD)/buildinfo.h "$(strip $(if $(filter 1,$(LTO)),lto) $(if $(filter 1,$(HWCHECK)),hwcheck) $(if $(filter verify,$(HWCHECK)),hwverify) $(if $(filter 0,$(WRMAP)),wrepoch) $(if $(filter 1,$(STORECHECK)),storecheck) $(if $(filter 0,$(AXFAST)),axref) $(if $(filter 0,$(AXWORKER)),axsync) $(if $(filter 1,$(ALIGNVERIFY)),alignverify) $(GENOPT))"
+	@sh tools/buildinfo.sh $(BUILD)/buildinfo.h "$(strip $(if $(filter 1,$(LTO)),lto) $(if $(filter 1,$(HWCHECK)),hwcheck) $(if $(filter verify,$(HWCHECK)),hwverify) $(if $(filter 0,$(WRMAP)),wrepoch) $(if $(filter 1,$(STORECHECK)),storecheck) $(if $(filter 0,$(AXFAST)),axref) $(if $(filter 0,$(AXWORKER)),axsync) $(if $(filter 0,$(AXSPEC)),axnospec)$(if $(filter 1,$(ALIGNVERIFY)),alignverify) $(if $(filter 1,$(RANGEVERIFY)),rangeverify) $(GENOPT))"
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 	@python3 tools/check_3dsx.py $(TARGET).3dsx
 $(BUILD):

@@ -20,7 +20,7 @@ static void dma(u32 type, u32 mram, u32 aaddr, u32 len) {
     if (!aram) aram = calloc(1, ARAM_SIZE);
     aaddr &= ARAM_SIZE - 1;
     if (aaddr + len > ARAM_SIZE) { recomp_log("# AR: DMA past ARAM end %lx+%lx\n", (unsigned long)aaddr, (unsigned long)len); return; }
-    if (type == 0) memcpy(aram + aaddr, ram + (mram & RAM_MASK), len);
+    if (type == 0) { memcpy(aram + aaddr, ram + (mram & RAM_MASK), len); recomp_aram_written(aaddr, len); }   /* ax.c decode predictions */
     else { recomp_mark_ram(mram, len); memcpy(ram + (mram & RAM_MASK), aram + aaddr, len); }
 }
 

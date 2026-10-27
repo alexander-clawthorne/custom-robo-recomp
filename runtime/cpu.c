@@ -85,9 +85,10 @@ u32 hw_read_verify(u32 a, int size) {
                    (unsigned long)recomp_hwcheck_loads);
     return hw_read(a, size);
 }
-#ifdef RECOMP_ALIGN_VERIFY
+#if defined(RECOMP_ALIGN_VERIFY) || defined(RECOMP_RANGE_VERIFY)
 /* make ALIGNVERIFY=1: misaligned 16/32-bit guest accesses per host site (the inlined helper in a gen/ f_X or a
- * runtime/ function; map with addr2line), with the first address and guest lr; counts every 600 retraces */
+ * runtime/ function; map with addr2line), with the first address and guest lr; counts every 600 retraces.
+ * make RANGEVERIFY=1: the same lines for 8/16/32-bit accesses outside 0x80000000-0x81ffffff. */
 static struct { const void *pc; u32 a, lr, n; u8 size; } al_site[512];
 static u32 al_sites, al_total[5], al_lost;
 void recomp_align_miss(u32 a, int n) {
@@ -102,8 +103,8 @@ void recomp_align_miss(u32 a, int n) {
 }
 void recomp_align_report(u32 retrace) {
     if (retrace % 600) return;
-    recomp_log("# align r%lu: misaligned 16-bit %lu, 32-bit %lu; %lu sites (%lu over the table)\n", (unsigned long)retrace,
-               (unsigned long)al_total[2], (unsigned long)al_total[4], (unsigned long)al_sites, (unsigned long)al_lost);
+    recomp_log("# align r%lu: 8-bit %lu, 16-bit %lu, 32-bit %lu; %lu sites (%lu over the table)\n", (unsigned long)retrace,
+               (unsigned long)al_total[1], (unsigned long)al_total[2], (unsigned long)al_total[4], (unsigned long)al_sites, (unsigned long)al_lost);
     for (u32 i = 0; i < al_sites; i++)
         recomp_log("# align count %p size %d %lu addr %08lx lr=%08lx\n", al_site[i].pc, al_site[i].size, (unsigned long)al_site[i].n,
                    (unsigned long)al_site[i].a, (unsigned long)al_site[i].lr);

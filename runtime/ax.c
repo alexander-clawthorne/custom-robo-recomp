@@ -220,11 +220,17 @@ static s16 fetch(Src *s) {
     return out;
 }
 
+/* what a frame's decode did besides the samples: loop wraps, a stop (and the address it stopped at, for
+ * vlog), and with track the lowest and highest ARAM byte it read */
+typedef struct { u32 looped, stop_cur, alo, ahi; u8 stopped; } DecEv;
+
 /* n source samples into out[], the same values and state changes as n fetch() calls, with the
- * ARAM bytes read directly and the state in locals */
-static void decode(Src *s, const u8 *A, s16 *out, u32 n) {
+ * ARAM bytes read directly and the state in locals. lp = the PB's loop predictor/history (ps, yn1, yn2).
+ * The caller applies ev (st counters, vlog), so this also runs on the mix worker. */
+static inline __attribute__((always_inline)) void decode_t(Src *s, const u8 *A, s16 *out, u32 n, const s16 *lp, DecEv *ev, int track) {
     const u32 M = 0x00ffffffu;   /* ARAM_SIZE - 1, as recomp_aram_read8 masks */
-    u32 cur = s->cur, end = s->end, i = 0;
+    u32 cur = s->cur, end = s->end, i = 0, lo = ~0u, hi = 0;
+    ev->looped = 0; ev->stopped = 0;
     if (s->stopped) goto zero;
     if (s->fmt == 0) {                        /* DSP-ADPCM */
         u32 ps = s->ps;
@@ -232,9 +238,11 @@ static void decode(Src *s, const u8 *A, s16 *out, u32 n) {
         s32 c1 = s->coef[(ps >> 4) * 2 & 15], c2 = s->coef[((ps >> 4) * 2 + 1) & 15];
         for (; i < n; i++) {
             if ((cur & 15) == 0) {
+                if (track) { u32 a = (cur >> 1) & M; lo = a < lo ? a : lo; hi = a > hi ? a : hi; }
                 ps = A[(cur >> 1) & M]; cur += 2;
                 c1 = s->coef[(ps >> 4) * 2 & 15]; c2 = s->coef[((ps >> 4) * 2 + 1) & 15];
             }
+            if (track) { u32 a = (cur >> 1) & M; lo = a < lo ? a : lo; hi = a > hi ? a : hi; }
             u32 b = A[(cur >> 1) & M];
             s32 nib = (cur & 1) ? (b & 15) : (b >> 4);
             if (nib >= 8) nib -= 16;
@@ -245,12 +253,12 @@ static void decode(Src *s, const u8 *A, s16 *out, u32 n) {
             if (cur == end) {
                 if (s->looping) {
                     cur = s->loop;
-                    ps = (u16)rd16(s->v + P_ADPCMLOOP);
-                    if (!s->is_stream) { yn1 = (s16)rd16(s->v + P_ADPCMLOOP + 2); yn2 = (s16)rd16(s->v + P_ADPCMLOOP + 4); }
+                    ps = (u16)lp[0];
+                    if (!s->is_stream) { yn1 = lp[1]; yn2 = lp[2]; }
                     c1 = s->coef[(ps >> 4) * 2 & 15]; c2 = s->coef[((ps >> 4) * 2 + 1) & 15];
-                    st.looped++;
+                    ev->looped++;
                 } else {
-                    s->stopped = 1; st.ended++; vlog("ended", s->v, cur);
+                    s->stopped = 1; ev->stopped = 1; ev->stop_cur = cur;
                     i++; break;
                 }
             } else cur++;
@@ -259,17 +267,24 @@ static void decode(Src *s, const u8 *A, s16 *out, u32 n) {
     } else {                                  /* PCM16 (word addresses) / PCM8 */
         int w = s->fmt == 0x0a;
         for (; i < n; i++) {
+            if (track) {
+                u32 a0 = (w ? cur * 2 : cur) & M, a1 = w ? (cur * 2 + 1) & M : a0;
+                lo = a0 < lo ? a0 : lo; hi = a0 > hi ? a0 : hi; lo = a1 < lo ? a1 : lo; hi = a1 > hi ? a1 : hi;
+            }
             out[i] = w ? (s16)((A[(cur * 2) & M] << 8) | A[(cur * 2 + 1) & M]) : (s16)((s8)A[cur & M] << 8);
             if (cur == end) {
-                if (s->looping) { cur = s->loop; st.looped++; }
-                else { s->stopped = 1; st.ended++; vlog("ended", s->v, cur); i++; break; }
+                if (s->looping) { cur = s->loop; ev->looped++; }
+                else { s->stopped = 1; ev->stopped = 1; ev->stop_cur = cur; i++; break; }
             } else cur++;
         }
     }
     s->cur = cur;
 zero:
     for (; i < n; i++) out[i] = 0;
+    ev->alo = lo; ev->ahi = hi;
 }
+static void decode(Src *s, const u8 *A, s16 *out, u32 n, const s16 *lp, DecEv *ev) { decode_t(s, A, out, n, lp, ev, 0); }
+static void decode_track(Src *s, const u8 *A, s16 *out, u32 n, const s16 *lp, DecEv *ev) { decode_t(s, A, out, n, lp, ev, 1); }
 
 /* ---- mix jobs. The game thread decodes each voice's samples for the frame and writes back the PB state
  * the DSP would (what the sound driver's tick reads); the resampling, volumes, sum and output then run from
@@ -283,8 +298,119 @@ typedef struct {
     s16 pool[POOL];
     s32 fbL[FRAME], fbR[FRAME];    /* voices mixed by mix_voice (AXFAST=0, no ARAM, too many samples) */
     u32 report;                    /* the 1000-frame line after this frame, with the game thread's counts */
-    u32 frames, started, active_max, ended, looped, underruns, skipped, trimmed, rt;
+    u32 frames, started, active_max, ended, looped, underruns, skipped, trimmed, rt, spec_hits, spec_tries;
+    u32 fi, npost;                /* AX frame number; voices still playing after it, with their decode block: */
+    struct { u8 vi; u16 type; u8 blk[76]; } post[VPB_COUNT];
 } FJob;
+
+/* ---- decode predictions (mix worker). A voice's decode for one AX frame depends only on the 76 bytes of its
+ * PB at +0x6e..+0xba (looping, format, loop/end/current address, ADPCM coefs/gain/predictor/history, SRC ratio,
+ * fraction and history, loop predictor/history; BLK), on P_TYPE and on the ARAM bytes it reads. After each mix
+ * job the worker decodes the next SPEC_K frames of every voice still playing from the block the frame left,
+ * chaining each prediction's resulting block into the next. The game thread takes a prediction only when the
+ * voice's block and type equal the prediction's key and no ARAM DMA since it was made touched the range it read;
+ * then the samples and the state it writes are the ones its own decode would make. ---- */
+#define BLK (PB + 0x6e)
+#define BLK_N 76
+#define SPEC_K 4                   /* AX frames predicted ahead per voice */
+#define SPEC_R 8                   /* ring slots per voice: more than SPEC_K, so a slot is not rewritten while read */
+#define SPEC_MAXS 512              /* decoded samples per prediction (ratio up to 3.2) */
+typedef struct {
+    volatile u32 seq;              /* odd while the worker writes it */
+    u32 frame, gen;                /* AX frame it is for; aram_gen before its decode read ARAM */
+    u16 type; u8 key[BLK_N], next[BLK_N];   /* the block it was made from; the block it leaves */
+    u32 total; DecEv ev;
+    s16 h[4 + SPEC_MAXS];          /* SRC history, then the decoded samples */
+} SpecEnt;
+static SpecEnt spec[VPB_COUNT][SPEC_R];
+static int job_worker;             /* the job ring below: 1 = a worker thread */
+static u32 spec_last[VPB_COUNT];   /* worker: last frame predicted per voice (0 = none) */
+static u32 spec_hits, spec_tries;  /* game thread, for the 5 s line */
+#ifdef RECOMP_AX_NO_SPEC
+static const int spec_on = 0;      /* make AXSPEC=0 */
+#else
+static const int spec_on = 1;
+#endif
+
+/* ARAM writes (ar.c, game thread): a ring of recent DMA ranges, newest generation aram_gen */
+#define DMA_LOG 64
+static struct { u32 gen, lo, hi; } dma_log[DMA_LOG];
+static volatile u32 aram_gen;
+void recomp_aram_written(u32 a, u32 n) {
+    if (!n) return;
+    u32 g = aram_gen + 1;
+    dma_log[g % DMA_LOG].gen = g; dma_log[g % DMA_LOG].lo = a; dma_log[g % DMA_LOG].hi = a + n - 1;
+    __dmb();   /* the bytes (written before the call) and the record before the generation */
+    aram_gen = g;
+}
+static int aram_clean(u32 gen, u32 lo, u32 hi) {
+    u32 now = aram_gen;
+    if (now - gen >= DMA_LOG) return now == gen;
+    for (u32 g = gen + 1; g != now + 1; g++)
+        if (dma_log[g % DMA_LOG].lo <= hi && dma_log[g % DMA_LOG].hi >= lo) return 0;
+    return 1;
+}
+
+static inline u32 be16(const u8 *p) { return (u32)p[0] << 8 | p[1]; }
+static inline u32 be32(const u8 *p) { return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3]; }
+static inline void put16(u8 *p, u32 v) { p[0] = (u8)(v >> 8); p[1] = (u8)v; }
+
+/* worker: the prediction for frame f from block key (type t); 0 if it cannot be made */
+static int spec_make(SpecEnt *e, u32 f, const u8 *key, u16 t, const u8 *A) {
+    u32 ratio = be32(key + 0x38), frac = be16(key + 0x3c);
+    u64 total = ((u64)frac + (u64)ratio * FRAME) >> 16;
+    if (total > SPEC_MAXS) return 0;
+    e->seq++;
+    __dmb();
+    e->gen = aram_gen;
+    __dmb();   /* the generation before the ARAM reads */
+    Src s;
+    s.v = 0; s.looping = be16(key); s.fmt = be16(key + 2);
+    s.loop = be32(key + 4); s.end = be32(key + 8); s.cur = be32(key + 12);
+    for (int k = 0; k < 16; k++) s.coef[k] = (s16)be16(key + 0x10 + k * 2);
+    s.ps = be16(key + 0x32); s.yn1 = (s16)be16(key + 0x34); s.yn2 = (s16)be16(key + 0x36);
+    s.is_stream = t != 0; s.stopped = 0;
+    s16 lp[3] = { (s16)be16(key + 0x46), (s16)be16(key + 0x48), (s16)be16(key + 0x4a) };
+    for (int k = 0; k < 4; k++) e->h[k] = (s16)be16(key + 0x3e + k * 2);
+    decode_track(&s, A, e->h + 4, (u32)total, lp, &e->ev);
+    e->frame = f; e->type = t; e->total = (u32)total;
+    memcpy(e->key, key, BLK_N); memcpy(e->next, key, BLK_N);
+    put16(e->next + 12, s.cur >> 16); put16(e->next + 14, s.cur);
+    put16(e->next + 0x32, s.ps); put16(e->next + 0x34, (u16)s.yn1); put16(e->next + 0x36, (u16)s.yn2);
+    put16(e->next + 0x3c, (u32)(frac + (u64)ratio * FRAME));
+    for (int k = 0; k < 4; k++) put16(e->next + 0x3e + k * 2, (u16)e->h[total + k]);
+    __dmb();
+    e->seq++;
+    return 1;
+}
+
+/* worker, after job j: keep SPEC_K frames predicted for each voice still playing; a chain that matches the
+ * block the frame really left is extended, any other starts again from that block */
+static void spec_extend(const FJob *j) {
+    const u8 *A = recomp_aram();
+    if (!A) return;
+    for (u32 p = 0; p < j->npost; p++) {
+        u32 i = j->post[p].vi, f = j->fi + 1, last = j->fi + SPEC_K;
+        u16 t = j->post[p].type;
+        const u8 *key = j->post[p].blk;
+        const SpecEnt *e = &spec[i][f % SPEC_R];
+        if (spec_last[i] >= f && e->frame == f && e->type == t && !memcmp(e->key, key, BLK_N)) {
+            const SpecEnt *le = &spec[i][spec_last[i] % SPEC_R];   /* the chain holds: go on from its last prediction */
+            if (le->ev.stopped) continue;
+            f = spec_last[i] + 1;
+            key = le->next;
+        }
+        for (; f <= last; f++) {
+            SpecEnt *n = &spec[i][f % SPEC_R];
+            u8 k[BLK_N];
+            memcpy(k, key, BLK_N);
+            if (!spec_make(n, f, k, t, A)) { spec_last[i] = 0; break; }
+            spec_last[i] = f;
+            if (n->ev.stopped) break;   /* nothing to predict after a stop */
+            key = n->next;
+        }
+    }
+}
 
 static void mix_voice(u32 v, s32 *outL, s32 *outR);
 
@@ -293,10 +419,30 @@ static void slow_voice(u32 v, FJob *j) {
     mix_voice(v, j->fbL, j->fbR);
 }
 
+/* game thread: the prediction for voice i's frame fi if it still holds: its samples copied to h, its
+ * events and resulting state to *ev / *s (all copied before the slot's sequence is checked again) */
+static int spec_take(u32 i, u32 v, u32 fi, s16 *h, u32 room, DecEv *ev, Src *s) {
+    const SpecEnt *e = &spec[i][fi % SPEC_R];
+    u32 q = e->seq;
+    __dmb();
+    if ((q & 1) || e->frame != fi || e->total + 4 > room) return 0;
+    if (e->type != rd16(v + P_TYPE) || memcmp(e->key, ram + ((v + BLK) & RAM_MASK), BLK_N)) return 0;
+    *ev = e->ev;
+    if (!aram_clean(e->gen, ev->alo, ev->ahi)) return 0;
+    memcpy(h, e->h, (e->total + 4) * sizeof *h);
+    s->cur = be32(e->next + 12); s->ps = be16(e->next + 0x32);
+    s->yn1 = (s16)be16(e->next + 0x34); s->yn2 = (s16)be16(e->next + 0x36);
+    s->stopped = ev->stopped;
+    u32 tot = e->total;
+    __dmb();
+    return e->seq == q && tot + 4 <= room;
+}
+
 /* the game thread's part of a voice's frame: its source samples into the job, its PB state as after the
  * frame (as mix_voice leaves it) */
-static void voice_frame(u32 v, FJob *j) {
+static void voice_frame(u32 i, u32 v, FJob *j) {
 #ifdef RECOMP_AX_REF
+    (void)i;
     slow_voice(v, j);
 #else
     const u8 *A = recomp_aram();
@@ -305,24 +451,32 @@ static void voice_frame(u32 v, FJob *j) {
     u64 total = ((u64)frac + (u64)ratio * FRAME) >> 16;
     if (!A || total + 4 > POOL - j->used) { slow_voice(v, j); return; }
     Src s;
-    s.v = v;
-    s.looping = rd16(v + P_ADDR);
-    s.fmt = rd16(v + P_ADDR + 2);
-    s.loop = rd32(v + P_ADDR + 4);
-    s.end = rd32(v + P_ADDR + 8);
-    s.cur = rd32(v + P_ADDR + 12);
-    for (int k = 0; k < 16; k++) s.coef[k] = rd16(v + P_ADPCM + k * 2);
-    s.ps = rd16(v + P_ADPCM + 0x22);
-    s.yn1 = rd16(v + P_ADPCM + 0x24);
-    s.yn2 = rd16(v + P_ADPCM + 0x26);
-    s.is_stream = rd16(v + P_TYPE) != 0;
-    s.stopped = 0;
-
+    DecEv ev;
     VJob *vj = &j->v[j->nv++];
     s16 *h = j->pool + j->used;               /* last[0..3], then the samples fetched this frame */
     vj->off = j->used; j->used += (u32)total + 4;
-    for (int k = 0; k < 4; k++) h[k] = rd16(v + P_SRC + 6 + k * 2);
-    decode(&s, A, h + 4, (u32)total);
+    int hit = 0;
+    if (spec_on && job_worker == 1) { spec_tries++; hit = spec_take(i, v, j->fi, h, POOL - vj->off, &ev, &s); }
+    if (hit) spec_hits++;   /* the samples are in h, the state the decode would leave in s */
+    else {
+        s.v = v;
+        s.looping = rd16(v + P_ADDR);
+        s.fmt = rd16(v + P_ADDR + 2);
+        s.loop = rd32(v + P_ADDR + 4);
+        s.end = rd32(v + P_ADDR + 8);
+        s.cur = rd32(v + P_ADDR + 12);
+        for (int k = 0; k < 16; k++) s.coef[k] = rd16(v + P_ADPCM + k * 2);
+        s.ps = rd16(v + P_ADPCM + 0x22);
+        s.yn1 = rd16(v + P_ADPCM + 0x24);
+        s.yn2 = rd16(v + P_ADPCM + 0x26);
+        s.is_stream = rd16(v + P_TYPE) != 0;
+        s.stopped = 0;
+        s16 lp[3] = { (s16)rd16(v + P_ADPCMLOOP), (s16)rd16(v + P_ADPCMLOOP + 2), (s16)rd16(v + P_ADPCMLOOP + 4) };
+        for (int k = 0; k < 4; k++) h[k] = rd16(v + P_SRC + 6 + k * 2);
+        decode(&s, A, h + 4, (u32)total, lp, &ev);
+    }
+    st.looped += ev.looped;
+    if (ev.stopped) { st.ended++; vlog("ended", v, ev.stop_cur); }
     vj->ratio = ratio; vj->frac = frac;
     vj->ve = rd16(v + P_VE); vj->ved = rd16(v + P_VE + 2);
     vj->vl = rd16(v + P_MIX); vj->vr = rd16(v + P_MIX + 4);
@@ -341,6 +495,11 @@ static void voice_frame(u32 v, FJob *j) {
     for (int k = 0; k < 4; k++) wr16(v + P_SRC + 6 + k * 2, h[total + k]);
     wr16(v + P_VE, ve);
     wr16(v + P_MIX, vl); wr16(v + P_MIX + 4, vr);
+    if (spec_on && job_worker == 1 && !s.stopped) {   /* the block this frame left, for the worker's predictions */
+        u32 n = j->npost++;
+        j->post[n].vi = (u8)i; j->post[n].type = rd16(v + P_TYPE);
+        memcpy(j->post[n].blk, ram + ((v + BLK) & RAM_MASK), BLK_N);
+    }
 #endif
 }
 
@@ -517,11 +676,12 @@ static int job_worker = -1;        /* -1 not started yet, 0 none (jobs run at on
 /* the job's output: the 5 s line (before this frame's output, as it always was), ndsp and the WAV */
 static void job_out(const FJob *j) {
     if (j->report) {
-        recomp_log("# AX: frame %lu voices started %lu max active %lu ended %lu loops %lu peak %lu ndsp bufs %lu dropped frames %lu rms %lu, hash %08lx; pacing %s, underruns %lu, skipped %lu, trimmed %lu\n",
+        recomp_log("# AX: frame %lu voices started %lu max active %lu ended %lu loops %lu peak %lu ndsp bufs %lu dropped frames %lu rms %lu, hash %08lx; pacing %s, underruns %lu, skipped %lu, trimmed %lu; decode predictions %lu of %lu\n",
                    (unsigned long)j->frames, (unsigned long)j->started, (unsigned long)j->active_max,
                    (unsigned long)j->ended, (unsigned long)j->looped, (unsigned long)st.peak, (unsigned long)st.queued, (unsigned long)st.dropped,
                    (unsigned long)__builtin_sqrt((double)st.sumsq / (FRAME * 1000)), (unsigned long)st.hash, j->rt ? "rt" : "retrace",
-                   (unsigned long)j->underruns, (unsigned long)j->skipped, (unsigned long)j->trimmed);
+                   (unsigned long)j->underruns, (unsigned long)j->skipped, (unsigned long)j->trimmed,
+                   (unsigned long)j->spec_hits, (unsigned long)j->spec_tries);
         st.peak = st.queued = st.dropped = 0; st.sumsq = 0;
     }
     out_frame();
@@ -542,6 +702,7 @@ static void job_worker_fn(void *arg) {
         const FJob *j = &jobs[r % NJOB];
         job_mix(j);
         job_out(j);
+        if (spec_on) spec_extend(j);
         __dmb();   /* done with the job before the game thread may refill it */
         job_r = r + 1;
         __dmb();
@@ -580,6 +741,7 @@ static FJob *ax_frame(void) {
     if (job_worker == 1 && job_w - job_r >= NJOB) job_drain(job_w - NJOB + 1);
     FJob *j = &jobs[job_w % NJOB];
     j->nv = j->used = j->fb = 0;
+    j->fi = st.frames; j->npost = 0;
     u32 active = 0;
     for (u32 i = 0; i < VPB_COUNT; i++) {
         u32 v = VPB_BASE + i * VPB_SIZE;
@@ -587,15 +749,16 @@ static FJob *ax_frame(void) {
         wr32(v + V_SYNC, 0);                /* user changes consumed (__AXSyncPBs) */
         if (rd16(v + P_STATE) != 1) continue;
         active++;
-        voice_frame(v, j);
+        voice_frame(i, v, j);
     }
     if (active > st.active_max) st.active_max = active;
     j->report = ++st.frames % 1000 == 0;   /* every 5 s of audio */
     if (j->report) {
         j->frames = st.frames; j->started = voices_started; j->active_max = st.active_max; j->ended = st.ended;
         j->looped = st.looped; j->underruns = st.underruns; j->skipped = st.skipped; j->trimmed = st.trimmed;
-        j->rt = recomp_ax_rt;
+        j->rt = recomp_ax_rt; j->spec_hits = spec_hits; j->spec_tries = spec_tries;
         st.active_max = st.ended = st.looped = st.underruns = st.skipped = st.trimmed = 0;
+        spec_hits = spec_tries = 0;
     }
     return j;
 }

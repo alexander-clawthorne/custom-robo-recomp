@@ -126,14 +126,19 @@ static inline __attribute__((always_inline)) void gx_fifo_put(u32 v, int n) {
 #ifdef RECOMP_ALIGN_VERIFY
 void recomp_align_miss(u32 a, int n) __attribute__((noinline));
 #define ALN(a, n) (__builtin_expect(((a) & ((n) - 1)) != 0, 0) ? recomp_align_miss((a), (n)) : (void)0)
+#elif defined(RECOMP_RANGE_VERIFY)
+/* make RANGEVERIFY=1: every 8/16/32-bit guest access outside 0x80000000-0x81ffffff goes to the same log (cpu.c),
+ * to see how often the uncached mirror or other ranges are used (unknowns "Guest address ranges") */
+void recomp_align_miss(u32 a, int n) __attribute__((noinline));
+#define ALN(a, n) (__builtin_expect(((a) >> 25) != 0x40u, 0) ? recomp_align_miss((a), (n)) : (void)0)
 #else
 #define ALN(a, n) ((void)0)
 #endif
-RI u8  rd8 (u32 a){ if (LOAD_HW(a)) return HW_READ(a,1); return ram[a & RAM_MASK]; }
+RI u8  rd8 (u32 a){ ALN(a, 1); if (LOAD_HW(a)) return HW_READ(a,1); return ram[a & RAM_MASK]; }
 RI u16 rd16(u32 a){ ALN(a, 2); if (LOAD_HW(a)) return HW_READ(a,2); u16 v; memcpy(&v, ram + (a & RAM_MASK), 2); return __builtin_bswap16(v); }
 RI u32 rd32(u32 a){ ALN(a, 4); if (LOAD_HW(a)) return HW_READ(a,4); u32 v; memcpy(&v, ram + (a & RAM_MASK), 4); return __builtin_bswap32(v); }
 RI u64 rd64(u32 a){ return ((u64)rd32(a) << 32) | rd32(a + 4); }
-RI void wr8 (u32 a, u8 v){ if (STORE_HW(a)) { HW_WRITE(a,v,1); return; } WR_MARK(a); ram[a & RAM_MASK] = v; }
+RI void wr8 (u32 a, u8 v){ ALN(a, 1); if (STORE_HW(a)) { HW_WRITE(a,v,1); return; } WR_MARK(a); ram[a & RAM_MASK] = v; }
 RI void wr16(u32 a, u16 v){ ALN(a, 2); if (STORE_HW(a)) { HW_WRITE(a,v,2); return; } WR_MARK(a); v = __builtin_bswap16(v); memcpy(ram + (a & RAM_MASK), &v, 2); }
 RI void wr32(u32 a, u32 v){ ALN(a, 4); if (STORE_HW(a)) { HW_WRITE(a,v,4); return; } WR_MARK(a); v = __builtin_bswap32(v); memcpy(ram + (a & RAM_MASK), &v, 4); }
 RI void wr64(u32 a, u64 v){ wr32(a, (u32)(v >> 32)); wr32(a + 4, (u32)v); }
@@ -170,11 +175,11 @@ RI void wr64_sp(u32 b, s32 k, u64 v){ wr32_sp(b, k, (u32)(v >> 32)); wr32_sp(b, 
 #define RAM_GUARD 0x8000u
 RI u8 *b_at(u32 b, s32 k){ return ram + (b & RAM_MASK) + k; }
 #define WR_MARK_B(b, k) WR_SET((s32)(((b) & RAM_MASK) + (k)) >> WR_PAGE_SHIFT)
-RI u8  rd8_b (u32 b, s32 k){ if (LOAD_HW(b)) return HW_READ(b + k,1); return *b_at(b, k); }
+RI u8  rd8_b (u32 b, s32 k){ ALN(b + k, 1); if (LOAD_HW(b)) return HW_READ(b + k,1); return *b_at(b, k); }
 RI u16 rd16_b(u32 b, s32 k){ ALN(b + k, 2); if (LOAD_HW(b)) return HW_READ(b + k,2); u16 v; memcpy(&v, b_at(b, k), 2); return __builtin_bswap16(v); }
 RI u32 rd32_b(u32 b, s32 k){ ALN(b + k, 4); if (LOAD_HW(b)) return HW_READ(b + k,4); u32 v; memcpy(&v, b_at(b, k), 4); return __builtin_bswap32(v); }
 RI u64 rd64_b(u32 b, s32 k){ return ((u64)rd32_b(b, k) << 32) | rd32_b(b, k + 4); }
-RI void wr8_b (u32 b, s32 k, u8 v){ if (STORE_HW(b)) { HW_WRITE(b + k,v,1); return; } WR_MARK_B(b, k); *b_at(b, k) = v; }
+RI void wr8_b (u32 b, s32 k, u8 v){ ALN(b + k, 1); if (STORE_HW(b)) { HW_WRITE(b + k,v,1); return; } WR_MARK_B(b, k); *b_at(b, k) = v; }
 RI void wr16_b(u32 b, s32 k, u16 v){ ALN(b + k, 2); if (STORE_HW(b)) { HW_WRITE(b + k,v,2); return; } WR_MARK_B(b, k); v = __builtin_bswap16(v); memcpy(b_at(b, k), &v, 2); }
 RI void wr32_b(u32 b, s32 k, u32 v){ ALN(b + k, 4); if (STORE_HW(b)) { HW_WRITE(b + k,v,4); return; } WR_MARK_B(b, k); v = __builtin_bswap32(v); memcpy(b_at(b, k), &v, 4); }
 RI void wr64_b(u32 b, s32 k, u64 v){ wr32_b(b, k, (u32)(v >> 32)); wr32_b(b, k + 4, (u32)v); }
@@ -491,6 +496,7 @@ void recomp_prof_sampler_start(void);  /* cpu.lr histogram thread (log.c) */
 void recomp_ax_close(void);             /* flushes the WAV dump, stops ndsp */
 u32 recomp_retrace_count(void);
 u8 recomp_aram_read8(u32 a);            /* ARAM byte (runtime/ar.c) */
+void recomp_aram_written(u32 a, u32 n);  /* ax.c: n ARAM bytes at a were just written (ar.c DMA, game thread) */
 void recomp_wait_point(void);           /* pending "interrupts": DVD, then ARQ */
 u64  recomp_timebase(void);             /* Gekko timebase, 40.5 MHz */
 void recomp_gx_init(void);             /* citro3d, render target, shader */
